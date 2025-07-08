@@ -1,3 +1,7 @@
+# 注意
+- 応答は日本語で
+- 私はtypescript初心者です
+
 # Claude Code Web UI
 
 A web-based interface for the `claude` command line tool that provides streaming responses in a chat interface.
