@@ -6,6 +6,18 @@
 
 A web-based interface for the `claude` command line tool that provides streaming responses in a chat interface.
 
+## サブスクリプション版への変更計画
+
+### 変更点の概要
+- **API利用** → **サブスクリプション利用** へ変更
+- Claude Code SDKの設定を無効化し、直接的なコマンド実行を採用
+- セッション管理をサブスクリプション版の仕様に合わせて調整
+
+### アーキテクチャ
+```
+[ブラウザ] ↔ [WebSocket] ↔ [Node.jsサーバー] ↔ [子プロセス] ↔ [Claude Code Subscription]
+```
+
 ## Code Quality
 
 This project uses automated quality checks to ensure consistent code standards:
@@ -37,6 +49,196 @@ The pre-commit hook prevents commits with formatting, linting, or test failures.
    ```
 
 The `.lefthook.yml` configuration is tracked in the repository, ensuring consistent quality checks across all contributors.
+
+## サブスクリプション版の主要修正点
+
+### バックエンドの変更
+
+#### Claude Code実行設定の変更
+**修正対象**: `backend/handlers/chat.ts`
+
+```typescript
+// 修正前: API用の設定
+const executionConfig = getClaudeExecutionConfig(claudePath, runtime);
+
+for await (
+  const sdkMessage of query({
+    prompt: processedMessage,
+    options: {
+      abortController,
+      ...executionConfig, // API用設定
+      ...(sessionId ? { resume: sessionId } : {}),
+      ...(allowedTools ? { allowedTools } : {}),
+      ...(workingDirectory ? { cwd: workingDirectory } : {}),
+    },
+  })
+)
+
+// 修正後: サブスクリプション用の設定
+// 直接コマンド実行に変更
+const claudeProcess = runtime.spawn('claude', [
+  processedMessage,
+  ...(sessionId ? ['--resume', sessionId] : []),
+  ...(workingDirectory ? ['--cwd', workingDirectory] : []),
+], {
+  cwd: workingDirectory,
+  env: {
+    ...process.env,
+  }
+});
+```
+
+#### バージョンチェックの簡素化
+**修正対象**: `backend/cli/deno.ts`
+
+```typescript
+// 修正前: API向けのバージョンチェック
+async function validateClaudeCli(runtime: DenoRuntime) {
+  try {
+    const result = await runtime.runCommand("claude", ["--version"]);
+    if (result.success) {
+      console.log(`✅ Claude CLI found: ${result.stdout.trim()}`);
+    } else {
+      console.warn("⚠️  Claude CLI check failed - some features may not work");
+    }
+  } catch (_error) {
+    console.warn("⚠️  Claude CLI not found - please install claude-code");
+  }
+}
+
+// 修正後: サブスクリプション向けの簡易チェック
+async function validateClaudeCli(runtime: DenoRuntime) {
+  try {
+    const result = await runtime.runCommand("claude", ["--version"]);
+    if (result.success) {
+      console.log(`✅ Claude CLI found: ${result.stdout.trim()}`);
+    } else {
+      console.warn("⚠️  Claude CLI check failed - some features may not work");
+    }
+  } catch (_error) {
+    console.warn("⚠️  Claude CLI not found - please install claude-code");
+    console.warn("   Visit: https://claude.ai/code for installation instructions");
+  }
+}
+```
+
+#### メッセージ処理の調整
+**修正対象**: `backend/handlers/chat.ts`
+
+```typescript
+// サブスクリプション版では、より直接的なストリーミング処理
+async function* executeClaudeCommand(
+  message: string,
+  requestId: string,
+  requestAbortControllers: Map<string, AbortController>,
+  runtime: Runtime,
+  sessionId?: string,
+  allowedTools?: string[],
+  workingDirectory?: string,
+  debugMode?: boolean,
+): AsyncGenerator<StreamResponse> {
+  let abortController: AbortController;
+
+  try {
+    abortController = new AbortController();
+    requestAbortControllers.set(requestId, abortController);
+
+    // サブスクリプション版用のコマンド構築
+    const claudeArgs = [
+      message,
+      ...(sessionId ? ['--resume', sessionId] : []),
+      ...(workingDirectory ? ['--cwd', workingDirectory] : []),
+      '--stream', // ストリーミング出力を有効化
+    ];
+
+    // 子プロセスとして実行
+    const claudeProcess = runtime.spawn('claude', claudeArgs, {
+      cwd: workingDirectory,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    // ストリーミング出力を処理
+    for await (const chunk of claudeProcess.stdout) {
+      if (abortController.signal.aborted) break;
+      
+      const output = new TextDecoder().decode(chunk);
+      // サブスクリプション版の出力形式に合わせてパース
+      const lines = output.split('\n').filter(line => line.trim());
+      
+      for (const line of lines) {
+        try {
+          // JSONラインかプレーンテキストかを判定
+          if (line.startsWith('{')) {
+            const data = JSON.parse(line);
+            yield {
+              type: "claude_json",
+              data,
+            };
+          } else {
+            // プレーンテキストの場合はメッセージとして処理
+            yield {
+              type: "claude_json",
+              data: {
+                type: "assistant",
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: line }],
+                },
+                session_id: sessionId,
+              },
+            };
+          }
+        } catch (parseError) {
+          if (debugMode) {
+            console.debug("Failed to parse line:", line, parseError);
+          }
+        }
+      }
+    }
+
+    yield { type: "done" };
+  } catch (error) {
+    // エラーハンドリング
+    yield {
+      type: "error",
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    if (requestAbortControllers.has(requestId)) {
+      requestAbortControllers.delete(requestId);
+    }
+  }
+}
+```
+
+### 設定管理の変更
+
+#### 環境設定
+```typescript
+// backend/types.ts に追加
+export interface SubscriptionConfig {
+  // サブスクリプション特有の設定
+  enableDirectExecution: boolean;
+  maxConcurrentSessions: number;
+}
+
+// デフォルト設定
+const DEFAULT_SUBSCRIPTION_CONFIG: SubscriptionConfig = {
+  enableDirectExecution: true,
+  maxConcurrentSessions: 5,
+};
+```
+
+#### 起動時設定
+```bash
+# 起動時の簡易チェック
+echo "🚀 Claude Code WebUI (サブスクリプション版) を起動中..."
+node server.js
+```
+
+### ルーティングとハンドラーの簡素化
+
+既存の `/api/chat` エンドポイントを直接コマンド実行用に修正するのみで、新しいAPIエンドポイントは追加しません。
 
 ## Architecture
 
@@ -161,6 +363,164 @@ The SDK returns three types of JSON messages:
 2. **Assistant messages** (`type: "assistant"`) - Actual response content
 3. **Result messages** (`type: "result"`) - Execution summary with costs and usage
 
+## サブスクリプション版の動作概要
+
+### 起動フロー
+```
+1. Deno ランタイム初期化 (backend/cli/deno.ts)
+2. CLI引数解析 (--port, --host, --debug)
+3. Claude CLI の存在確認 (claude --version)
+4. Honoアプリケーション作成 (backend/app.ts)
+5. 静的ファイル配信設定
+6. APIルート設定
+7. HTTPサーバー起動 (デフォルト localhost:8080)
+```
+
+### 主要APIエンドポイント
+- `GET /api/projects` - プロジェクト一覧取得
+- `GET /api/projects/:encodedProjectName/histories` - 会話履歴一覧
+- `GET /api/projects/:encodedProjectName/histories/:sessionId` - 特定会話の詳細
+- `POST /api/chat` - チャット実行（メイン機能）
+- `POST /api/abort/:requestId` - リクエスト中断
+- `GET /*` - SPA用フォールバック（index.html配信）
+
+### チャット実行の詳細フロー (`POST /api/chat`)
+
+#### 現在の実装（API版）
+```typescript
+// 1. リクエスト受信
+ChatRequest {
+  message: string,
+  requestId: string,
+  sessionId?: string,
+  allowedTools?: string[],
+  workingDirectory?: string
+}
+
+// 2. Claude Code SDK経由で実行
+query({
+  prompt: message,
+  options: {
+    abortController,
+    executable: "node",
+    pathToClaudeCodeExecutable: claudePath,
+    resume: sessionId,
+    allowedTools,
+    cwd: workingDirectory
+  }
+})
+
+// 3. SDK出力をストリーミング処理
+for await (const sdkMessage of query(...)) {
+  // JSON形式でフロントエンドに送信
+  yield {
+    type: "claude_json",
+    data: sdkMessage
+  }
+}
+```
+
+#### 修正後（サブスクリプション版）
+```typescript
+// 1. 同じリクエスト形式を受信
+
+// 2. 直接claudeコマンド実行
+const claudeArgs = [
+  message,
+  ...(sessionId ? ['--resume', sessionId] : []),
+  ...(workingDirectory ? ['--cwd', workingDirectory] : []),
+  '--stream'
+];
+
+const process = spawn('claude', claudeArgs, {
+  cwd: workingDirectory,
+  stdio: ['pipe', 'pipe', 'pipe']
+});
+
+// 3. プロセス出力をストリーミング処理
+for await (const chunk of process.stdout) {
+  const output = new TextDecoder().decode(chunk);
+  // 出力をパースしてフロントエンドに送信
+}
+```
+
+### ストリーミング通信
+```
+[フロントエンド] 
+    ↓ WebSocket/fetch (POST /api/chat)
+[バックエンド]
+    ↓ Claude Code SDK/Direct Command
+[Claude]
+    ↑ NDJSON Stream
+[バックエンド]
+    ↑ NDJSON Stream 
+[フロントエンド]
+```
+
+### セッション・履歴管理
+```
+~/.claude/projects/
+├── {encoded-project-name}/
+│   ├── session-123.jsonl
+│   ├── session-456.jsonl
+│   └── ...
+```
+
+- 各セッションはJSONLファイルとして保存
+- プロジェクトパスは`~/.claude.json`から取得
+- エンコードされたディレクトリ名で履歴管理
+
+### 並行処理とリソース管理
+```typescript
+// リクエスト毎のAbortController管理
+const requestAbortControllers = new Map<string, AbortController>();
+
+// リクエスト開始時
+abortController = new AbortController();
+requestAbortControllers.set(requestId, abortController);
+
+// 中断時
+POST /api/abort/:requestId → abortController.abort()
+
+// 完了時
+requestAbortControllers.delete(requestId);
+```
+
+### エラーハンドリング
+```typescript
+// 段階的エラー処理
+1. Claude CLI存在確認エラー → 警告ログ
+2. コマンド実行エラー → StreamResponse error
+3. パース エラー → デバッグログ + 継続
+4. ネットワークエラー → HTTP 500
+```
+
+### 設定とランタイム抽象化
+```typescript
+// Runtime interface による抽象化
+interface Runtime {
+  readTextFile(path: string): Promise<string>;
+  runCommand(command: string, args: string[]): Promise<CommandResult>;
+  spawn(command: string, args: string[], options: SpawnOptions): Process;
+  // ...
+}
+
+// Deno実装
+class DenoRuntime implements Runtime {
+  // Deno固有の実装
+}
+```
+
+## 修正による変更点
+
+| 項目 | 現在（API版） | 修正後（サブスクリプション版） |
+|------|---------------|--------------------------------|
+| **実行方法** | Claude Code SDK | 直接`claude`コマンド |
+| **認証** | API Key設定 | サブスクリプション前提 |
+| **プロセス管理** | SDK内部処理 | 子プロセス直接管理 |
+| **出力形式** | SDK標準化済み | Raw出力をパース |
+| **エラー処理** | SDK統一形式 | コマンドレベルエラー |
+
 ## Session Continuity
 
 The application supports conversation continuity within the same chat session using Claude Code SDK's built-in session management.
@@ -185,6 +545,99 @@ The application supports conversation continuity within the same chat session us
 - **Improved UX**: Users can reference previous messages and build on earlier discussions
 - **Efficient**: Leverages Claude Code SDK's native session management
 - **Seamless**: Works automatically without user configuration
+
+## サブスクリプション版のドキュメント更新
+
+### README.md の修正点
+
+```markdown
+# Claude Code Web UI - サブスクリプション版
+
+## 前提条件
+
+- Claude Code CLI がインストールされていること
+- Claude サブスクリプションが有効であること
+
+## セットアップ
+
+1. Claude Code CLI のインストール
+   ```bash
+   # Claude Code CLI のインストール
+   npm install -g @anthropic-ai/claude-code
+   ```
+
+2. WebUI の起動
+   ```bash
+   # 依存関係のインストール
+   npm install
+   
+   # 開発サーバーの起動
+   npm run dev
+   ```
+
+## 注意事項
+
+- Claude サブスクリプションが必要です
+- API キーの設定は不要です
+```
+
+### package.json の scripts 更新
+
+```json
+{
+  "scripts": {
+    "dev": "npm run dev:backend & npm run dev:frontend",
+    "dev:backend": "cd backend && deno run --env-file --allow-net --allow-run --allow-read --allow-env --watch cli/deno.ts --debug",
+    "dev:frontend": "cd frontend && npm run dev"
+  }
+}
+```
+
+### エラーハンドリングの調整
+
+```typescript
+// backend/handlers/chat.ts での基本的なエラーハンドリング
+function handleExecutionError(error: Error): StreamResponse {
+  return {
+    type: "error",
+    error: `Claude execution failed: ${error.message}`
+  };
+}
+```
+
+### テストの更新
+
+基本機能テストの維持
+既存のテスト構造を維持し、API関連のテストのみを直接実行用に調整します。
+
+```typescript
+// backend/handlers/chat.test.ts（修正例）
+Deno.test("Chat handler - direct execution", async () => {
+  const mockRuntime = {
+    spawn: () => ({
+      stdout: createMockStream("Hello from Claude"),
+      stderr: createMockStream(""),
+      exitCode: Promise.resolve(0)
+    })
+  };
+
+  // テスト実装...
+});
+```
+
+### 本番環境での考慮事項
+
+#### プロセス管理
+- 子プロセスの適切な管理とクリーンアップ
+- プロセス数の制限とリソース管理
+
+#### エラーログ
+- Claude CLI の実行エラーの適切なログ記録
+- ユーザーへの分かりやすいエラーメッセージ
+
+#### パフォーマンス
+- 並行実行の最適化
+- メモリ使用量の監視
 
 ## Development
 
